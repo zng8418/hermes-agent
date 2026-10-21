@@ -12,10 +12,12 @@ delivered the text, it goes out as a trailing message via ``send_trailing_footer
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_MISSING = "\x00"  # sentinel: a placeholder whose value was unavailable
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -48,7 +50,7 @@ def _env_cwd() -> str:
 def resolve_footer_config(user_config: dict[str, Any] | None, platform_key: str | None = None) -> dict[str, Any]:
     """Resolve effective footer config: defaults (enabled=False) <
     ``display.runtime_footer`` < ``display.platforms.<platform_key>.runtime_footer``."""
-    resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS)}
+    resolved = {"enabled": False, "fields": list(_DEFAULT_FIELDS), "template": None}
     cfg = (user_config or {}).get("display") or {}
     plat_cfg = (cfg.get("platforms") or {}).get(platform_key) if platform_key else None
     sections = [cfg.get("runtime_footer"), plat_cfg.get("runtime_footer") if isinstance(plat_cfg, dict) else None]
@@ -59,6 +61,8 @@ def resolve_footer_config(user_config: dict[str, Any] | None, platform_key: str 
             resolved["enabled"] = bool(section.get("enabled"))
         if isinstance(section.get("fields"), list) and section["fields"]:
             resolved["fields"] = [str(f) for f in section["fields"]]
+        if isinstance(section.get("template"), str) and section["template"].strip():
+            resolved["template"] = section["template"]
     return resolved
 
 
@@ -77,6 +81,7 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
                           context_length: Optional[int], cwd: Optional[str] = None,
                           turn_seconds: Optional[float] = None,
                           requested_model: Optional[str] = None, served_model: Optional[str] = None,
+                          provider: Optional[str] = None, template: Optional[str] = None,
                           fields: Iterable[str] = _DEFAULT_FIELDS) -> str:
     """Render the footer line, or "" if no fields have data. Fields whose data is missing (and
     unknown field names) are skipped silently — a partial footer beats ``?%`` or empty slots."""
@@ -92,21 +97,72 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
             return f"{alias} → {served_model}"
         return ""
 
+    def context_window() -> str:
+        if context_length and context_length > 0:
+            return f"{context_length / 1_000_000:.1f}M tokens" if context_length >= 1_000_000 \
+                else f"{context_length // 1000}k tokens"
+        return ""
+
     renderers = {
         "model": lambda: _model_short(model),
+        "provider": lambda: (provider or "").strip(),
         "served_model": served,
         "context_pct": context_pct,
+        "context_window": context_window,
         # Skipped when the caller did not measure (None) or the value is negative.
         "latency": lambda: _format_latency(turn_seconds) if turn_seconds is not None and turn_seconds >= 0 else "",
         "cwd": lambda: _home_relative_cwd(cwd or _env_cwd()),
     }
+    if template:
+        # A template wins over the field list. A placeholder whose value is
+        # missing is dropped together with its surrounding separator, so the
+        # line never shows an empty slot ("Provider:  | Context: ...").
+        values = {
+            "model": _model_short(model),
+            "provider": (provider or "").strip(),
+            "served_model": served(),
+            "context_pct": context_pct(),
+            "context_window": context_window(),
+            "cwd": _home_relative_cwd(cwd or _env_cwd()),
+            "latency": _format_latency(turn_seconds) if turn_seconds is not None and turn_seconds >= 0 else "",
+        }
+        out = template
+        for key, val in values.items():
+            if val:
+                out = out.replace("{" + key + "}", val)
+            else:
+                # The placeholder carries no value: keep its label ("Provider:")
+                # but mark the value as unknown. A whole-segment placeholder
+                # ("{provider_segment}") drops the segment entirely.
+                out = out.replace("{" + key + "}", _MISSING)
+        # Whole-segment placeholders: "{provider_segment}" -> "Provider: x" or "".
+        labels = {
+            "model": "Model", "provider": "Provider", "served_model": "Served",
+            "context_pct": "Used", "context_window": "Context",
+            "cwd": "Cwd", "latency": "Latency",
+        }
+        for key, label in labels.items():
+            val = values.get(key) or ""
+            seg = f"{label}: {val}" if val else ""
+            out = out.replace("{" + key + "_segment}", seg)
+        # A bare placeholder left with no value renders as "-".
+        out = out.replace(_MISSING, "-")
+        # Tidy separators left behind by dropped segments (e.g. "a | | b" -> "a | b").
+        out = re.sub(r"([|｜])\s*(?:[|｜]\s*)+", r"\1 ", out)
+        # Tidy the separators left behind by dropped segments.
+        out = re.sub(r"([|｜])\s*([|｜])", r"\2", out)
+        out = re.sub(r"^\s*[|｜]\s*", "", out)
+        out = re.sub(r"\s*[|｜]\s*$", "", out)
+        out = re.sub(r"\s{2,}", " ", out).strip()
+        return out.strip()
     return _SEP.join(v for field in fields if (render := renderers.get(field)) and (v := render()))
 
 
 def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str | None,
                       model: Optional[str], context_tokens: int, context_length: Optional[int],
                       cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
-                      requested_model: Optional[str] = None, served_model: Optional[str] = None) -> str:
+                      requested_model: Optional[str] = None, served_model: Optional[str] = None,
+                      provider: Optional[str] = None) -> str:
     """Entry point for gateway/run.py: footer text, or "" when disabled / no data. Callers append it
     to the final response themselves, preserving a single blank line of separation.
     ``turn_seconds`` is the caller-measured (``time.monotonic()``) run duration; ``None`` skips the
@@ -117,4 +173,5 @@ def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str |
     return format_runtime_footer(model=model, context_tokens=context_tokens,
                                  context_length=context_length, cwd=cwd, turn_seconds=turn_seconds,
                                  requested_model=requested_model, served_model=served_model,
+                                 provider=provider, template=cfg.get("template"),
                                  fields=cfg.get("fields") or _DEFAULT_FIELDS)

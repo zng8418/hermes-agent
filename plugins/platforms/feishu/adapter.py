@@ -337,6 +337,10 @@ class FeishuAdapterSettings:
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
+    # In-process WS link watchdog; on by default (backward compat). YAML
+    # ``platforms.feishu.ws_watchdog: false`` turns it off, or env
+    # HERMES_FEISHU_WS_WATCHDOG=0 (env wins, like every platform setting).
+    ws_watchdog: bool = True
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: dict[str, FeishuGroupRule] = field(default_factory=dict)
@@ -1161,10 +1165,14 @@ def _install_lark_ws_isolation(ws_client_module: Any) -> None:
         _WS_ISOLATION_INSTALLED = True
 
 
-def _ws_watchdog_enabled() -> bool:
-    """``HERMES_FEISHU_WS_WATCHDOG=0/false/off/no`` disables the in-process link watchdog."""
-    raw = str(os.environ.get("HERMES_FEISHU_WS_WATCHDOG", "") or "").strip().lower()
-    return raw not in {"0", "false", "off", "no"}
+def _ws_watchdog_flag(raw: Any) -> bool:
+    """Tri-state ``ws_watchdog`` parse: unset/blank → on (the default, backward
+    compat); a YAML bool or an env string ``0/false/off/no`` turns it off.
+    Read through ``extra_or_secret`` so the scoped env rung beats YAML exactly
+    like every other platform setting."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _ws_watchdog_interval_secs() -> float:
@@ -1538,6 +1546,7 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
+            ws_watchdog=_ws_watchdog_flag(_extra_or_env("ws_watchdog", "HERMES_FEISHU_WS_WATCHDOG", "")),
             admins=frozenset(_id_set(extra.get("admins", []))),
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
@@ -1662,7 +1671,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # frozen loop, and its app-level ping loop never checks the PONG). The
                 # in-process watchdog samples the socket's TCP_INFO counters and forces a
                 # reconnect when the link stops making progress (#ws-silence).
-                if _ws_watchdog_enabled() and self._ws_watchdog_task is None:
+                if self._ws_watchdog and self._ws_watchdog_task is None:
                     self._ws_watchdog_task = asyncio.ensure_future(self._ws_watchdog_loop())
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)

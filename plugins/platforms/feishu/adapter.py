@@ -32,6 +32,8 @@ import logging
 import mimetypes
 import os
 import re
+import socket
+import struct
 import threading
 import time
 import uuid
@@ -144,6 +146,25 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 # --- Connection, retry and batching tuning ---
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
+# --- WS link watchdog (in-process self-healing; the external cron watchdog was removed) ---
+# Sampling cadence and stale budget. The threshold is NOT a literal "two zero samples": the
+# lark link carries protocol-level keepalive pings (websockets default 20s) and app-level
+# PING/PONG (server-configured, ≤120s typical), so a healthy link moves its TCP counters at
+# least every ~20-30s. Four samples of literal zero byte growth (~4 min) therefore cannot
+# fire on a healthy-but-idle link, while every observed death mode (server 3003 kick, TCP
+# blackhole, starved WS loop) shows zero progress for far longer.
+_WS_WATCHDOG_INTERVAL_DEFAULT = 60.0
+_WS_WATCHDOG_SOCKET_STRIKES_DEFAULT = 4
+# A live-but-starved WS loop (gateway load spikes pin the WS thread; Feishu answers 3003)
+# freezes the SDK frame counter while TCP-level counters keep moving — a different, faster
+# signal with its own budget: two samples without a single consumed frame.
+_WS_WATCHDOG_LOOP_STRIKES = 2
+# Bound on the graceful relink attempt before falling back to a hard thread rebuild
+# (nonce sleep ≤30s + bounded endpoint fetch + handshake).
+_WS_WATCHDOG_GRACEFUL_RELINK_TIMEOUT = 75.0
+# (connect, read) timeout for the SDK's WS-endpoint fetch (``requests.post`` ran with NO
+# timeout on the WS thread's loop — a degraded path froze the whole ladder for minutes).
+_WS_ENDPOINT_FETCH_TIMEOUT = (10.0, 15.0)
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
@@ -1108,6 +1129,69 @@ def _install_lark_ws_isolation(ws_client_module: Any) -> None:
         _WS_ISOLATION_INSTALLED = True
 
 
+def _ws_watchdog_enabled() -> bool:
+    """``HERMES_FEISHU_WS_WATCHDOG=0/false/off/no`` disables the in-process link watchdog."""
+    raw = str(os.environ.get("HERMES_FEISHU_WS_WATCHDOG", "") or "").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _ws_watchdog_interval_secs() -> float:
+    raw = str(os.environ.get("HERMES_FEISHU_WS_WATCHDOG_INTERVAL", "") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _WS_WATCHDOG_INTERVAL_DEFAULT
+    return max(value, 10.0)
+
+
+def _ws_watchdog_socket_strikes() -> int:
+    raw = str(os.environ.get("HERMES_FEISHU_WS_WATCHDOG_STRIKES", "") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return _WS_WATCHDOG_SOCKET_STRIKES_DEFAULT
+    return max(value, 2)
+
+
+def _tcp_info_sample(sock: Any) -> Optional[dict]:
+    """Read Linux TCP_INFO counters off the WS socket — never blocks, safe cross-thread.
+
+    Field offsets verified empirically against ``ss -ti`` on this deployment's kernel
+    (linux 6.x-class, raw struct length 280): state@0 (u8), last_data_recv@52 and
+    last_ack_recv@56 (u32, ms since the event), bytes_acked@120 and bytes_received@128
+    (u64). Kernels without the byte counters return a shorter struct — those fields are
+    then simply absent from the sample and the ms-since fields carry the signal.
+    """
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 512)
+    except OSError:
+        return None
+    if len(raw) < 60:
+        return None
+    sample: dict = {
+        "state": raw[0],
+        "last_data_recv_ms": struct.unpack_from("<I", raw, 52)[0],
+        "last_ack_recv_ms": struct.unpack_from("<I", raw, 56)[0],
+    }
+    if len(raw) >= 136:
+        acked, received = struct.unpack_from("<QQ", raw, 120)
+        # Defensive parse: trust the u64 counters only when they look like byte counts
+        # (a layout drift would yield astronomically large values, not silent lies).
+        if acked <= 2 ** 48 and received <= 2 ** 48:
+            sample["bytes_acked"] = acked
+            sample["bytes_received"] = received
+    return sample
+
+
+async def _ws_client_relink_async(ws_client: Any) -> None:
+    # The SDK's ladder is the only code that knows how to re-dial (endpoint fetch, nonce
+    # jitter, handshake); reuse it in-process on the same client so no duplicate socket
+    # can appear: ``_disconnect`` clears ``_conn`` and ``_reconnect`` re-dials under the
+    # client lock.
+    await ws_client._disconnect()
+    await ws_client._reconnect()
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local loop (see isolation notes above)."""
     import lark_oapi.ws.client as ws_client_module
@@ -1185,7 +1269,11 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
                 closer()
             except Exception:
                 pass
-        adapter._ws_thread_loop = None
+        # Only nil the pointer if no newer thread has registered its own loop since: a
+        # watchdog hard-rebuild starts a NEW thread while this (wedged) thread unwinds
+        # late, and an unconditional None would strip the live thread's registration.
+        if getattr(adapter, "_ws_thread_loop", None) is loop:
+            adapter._ws_thread_loop = None
 
 
 def _load_lark_oapi() -> bool:
@@ -1310,6 +1398,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sdk_executor_closing = False  # set on disconnect so a real teardown isn't resurrected
         self._ws_client = self._ws_future = self._ws_supervisor = self._ws_thread_loop = None
         self._ws_restart_backoff = 5.0
+        # In-process WS link watchdog (the external cron watchdog was removed; see
+        # _ws_watchdog_loop). Also guards concurrent forced relinks.
+        self._ws_watchdog_task: Optional[asyncio.Task] = None
+        self._ws_relink_in_progress = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner = self._webhook_site = self._event_handler = None
         self._seen_message_ids: dict[str, float] = {}  # message_id → seen_at (time.time())
@@ -1532,6 +1624,14 @@ class FeishuAdapter(BasePlatformAdapter):
             if self._connection_mode == "websocket":
                 # The WS thread can die without any external signal; keep a watcher alive.
                 self._ws_supervisor = asyncio.ensure_future(self._supervise_websocket_thread())
+                # A dead thread is not the only death mode: a BLACKHOLE TCP link or a
+                # starved WS loop leaves the supervisor's future pending forever while the
+                # channel is already deaf (the SDK's protocol keepalive cannot run on a
+                # frozen loop, and its app-level ping loop never checks the PONG). The
+                # in-process watchdog samples the socket's TCP_INFO counters and forces a
+                # reconnect when the link stops making progress (#ws-silence).
+                if _ws_watchdog_enabled() and self._ws_watchdog_task is None:
+                    self._ws_watchdog_task = asyncio.ensure_future(self._ws_watchdog_loop())
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             # Plugin-registered native handlers (lark_oapi client).
@@ -1547,6 +1647,10 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        watchdog_task = self._ws_watchdog_task
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            self._ws_watchdog_task = None
         if self._ws_supervisor is not None:
             self._ws_supervisor.cancel()
             self._ws_supervisor = None
@@ -3869,6 +3973,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 raise
             except Exception:
                 pass
+            # A watchdog forced relink may have replaced the client while this (wedged)
+            # thread's future was still unwinding: acting on the stale future would churn
+            # the fresh link. Loop back and await the CURRENT one.
+            if ws_future is not self._ws_future:
+                continue
             # Deliberate disconnects nil ``_ws_client``/``_running`` first; only restart a live link.
             if not self._running or self._ws_client is None:
                 return
@@ -3889,6 +3998,204 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("[Feishu] WebSocket restart failed (retrying): %s", exc)
                 backoff = min(backoff * 2, 60.0)
+
+    # --- WS link watchdog (in-process; the external cron watchdog was removed) ---
+    def _ws_link_probe(self) -> Optional[dict]:
+        """Snapshot the live lark WS link: connection object, socket and TCP counters.
+
+        Everything here is an attribute peek at the WS thread's objects (safe under the
+        GIL); the socket itself is only read via getsockopt(TCP_INFO), which never blocks
+        and never touches the WS thread's loop. Returns None when no client is live."""
+        ws_client = self._ws_client
+        if ws_client is None:
+            return None
+        conn = getattr(ws_client, "_conn", None)
+        if conn is None:
+            return {"link": "no-conn"}
+        probe: dict = {"link": "conn"}
+        transport = getattr(conn, "transport", None)
+        sock = None
+        if transport is not None:
+            try:
+                sock = transport.get_extra_info("socket")
+            except Exception:
+                sock = None
+        probe["has_socket"] = sock is not None
+        if sock is not None:
+            sample = _tcp_info_sample(sock)
+            if sample:
+                probe.update(sample)
+        counter = getattr(ws_client, "_hermes_frame_counter", None)
+        if counter is not None:
+            probe["frames"] = counter[0]
+        return probe
+
+    @staticmethod
+    def _ws_probe_stale(probe: Optional[dict], window_ms: float) -> tuple[bool, str]:
+        """Whether a probe shows a link making no forward progress, and why.
+
+        ``window_ms`` is the sample interval: TCP_INFO's ms-since-last-event fields
+        exceeding one full window mean literally nothing arrived during it. On a healthy
+        link the websockets keepalive (20s default cadence) and the SDK's own PING/PONG
+        (≤120s server-configured) move those fields at every sample."""
+        if probe is None:
+            return True, "no live ws client"
+        if probe.get("link") == "no-conn":
+            # SDK cleared its connection: its reconnect ladder is in flight. A healthy
+            # ladder re-dials within one server interval (~120s + jitter); a ladder wedged
+            # on the endpoint fetch (requests.post had NO timeout — see the bounded shim)
+            # holds this state for many minutes, so this must keep counting as stale.
+            return True, "connection object cleared (SDK reconnect ladder in flight)"
+        if not probe.get("has_socket"):
+            return True, "connection has no socket"
+        state = probe.get("state")
+        # 1 = TCP_ESTABLISHED; CLOSE_WAIT (8) after a server FIN nobody drained, etc.
+        if state is not None and state != 1:
+            return True, f"tcp state={state} (not ESTABLISHED)"
+        last_data = probe.get("last_data_recv_ms")
+        if last_data is not None and last_data > window_ms:
+            return True, f"no bytes received for {last_data / 1000:.0f}s"
+        last_ack = probe.get("last_ack_recv_ms")
+        if last_ack is not None and last_ack > window_ms:
+            return True, f"no acks received for {last_ack / 1000:.0f}s"
+        return False, ""
+
+    async def _ws_watchdog_loop(self) -> None:
+        """Periodically prove the Feishu WS link is alive, and force a reconnect when it is not.
+
+        Death modes this closes (all observed on this deployment):
+        * server 3003-kick after the WS thread starved (no app PING) — socket left half-dead;
+        * TCP blackhole through the overlay/NAT path — websockets keepalive cannot run when
+          the loop is frozen, and the SDK's ping loop never checks PONGs;
+        * the SDK reconnect ladder wedged on the timeout-less endpoint fetch — the adapter
+          kept its ``connected`` stamp for the whole outage (19 minutes observed).
+
+        The watchdog lives on the ADAPTER loop, so gateway-level load cannot freeze it the
+        way it freezes the WS thread; every action is bounded and identity-guarded."""
+        interval = _ws_watchdog_interval_secs()
+        window_ms = interval * 1000.0
+        socket_strike_limit = _ws_watchdog_socket_strikes()
+        socket_strikes = 0
+        loop_strikes = 0
+        prev_frames: Optional[int] = None
+        logger.info(
+            "[Feishu] WS watchdog armed: interval=%.0fs socket_strikes=%d loop_strikes=%d",
+            interval, socket_strike_limit, _WS_WATCHDOG_LOOP_STRIKES,
+        )
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._running:
+                return
+            probe = self._ws_link_probe()
+            stale, why = self._ws_probe_stale(probe, window_ms)
+            if stale:
+                socket_strikes += 1
+                loop_strikes = 0
+                logger.warning(
+                    "[Feishu] WS watchdog: link stale (%s); strike %d/%d [probe=%s]",
+                    why, socket_strikes, socket_strike_limit, probe,
+                )
+            else:
+                socket_strikes = 0
+                # TCP looks fine; require the WS loop to actually consume frames. Frames
+                # reach _handle_message at least every ~20s on a healthy link (server
+                # protocol keepalive), so two consecutive frozen samples mean the loop is
+                # starved and the link is deaf even though the socket is up.
+                frames = probe.get("frames")
+                if frames is not None and prev_frames is not None and frames == prev_frames:
+                    loop_strikes += 1
+                    logger.warning(
+                        "[Feishu] WS watchdog: ws loop consumed no frames in %.0fs; strike %d/%d",
+                        interval, loop_strikes, _WS_WATCHDOG_LOOP_STRIKES,
+                    )
+                else:
+                    loop_strikes = 0
+            prev_frames = probe.get("frames") if probe else None
+            if loop_strikes >= _WS_WATCHDOG_LOOP_STRIKES:
+                loop_strikes = socket_strikes = 0
+                prev_frames = None
+                await self._ws_force_relink("ws loop not consuming frames (event-loop starvation)")
+            elif socket_strikes >= socket_strike_limit:
+                socket_strikes = 0
+                prev_frames = None
+                await self._ws_force_relink(why)
+
+    async def _ws_force_relink(self, why: str) -> None:
+        """Force a dead/silent link to reconnect from inside the gateway process."""
+        if self._ws_relink_in_progress:
+            return
+        self._ws_relink_in_progress = True
+        try:
+            ws_client = self._ws_client
+            ws_loop = self._ws_thread_loop
+            if ws_client is None:
+                logger.warning("[Feishu] WS watchdog: no client to relink (%s); letting the supervisor work", why)
+                return
+            logger.error("[Feishu] WS watchdog: forcing reconnect (%s)", why)
+            self._write_runtime_status_safe(
+                "ws_link_lost", platform_state="retrying", error_code=None,
+                error_message=f"Feishu WS watchdog: forcing reconnect ({why})",
+            )
+            # 1) Graceful: hand the SDK's own ladder back the wheel on the WS thread's loop.
+            #    Identity guards (_ws_client is ws_client) make a LATE success of this old
+            #    client inert if we fall through to the hard rebuild.
+            if ws_loop is not None and not ws_loop.is_closed():
+                try:
+                    relink = asyncio.run_coroutine_threadsafe(_ws_client_relink_async(ws_client), ws_loop)
+                    await asyncio.wait_for(asyncio.wrap_future(relink), timeout=_WS_WATCHDOG_GRACEFUL_RELINK_TIMEOUT)
+                    logger.info("[Feishu] WS watchdog: SDK relink completed")
+                    return
+                except TimeoutError:
+                    logger.warning(
+                        "[Feishu] WS watchdog: graceful relink produced no result within %.0fs — "
+                        "the WS thread's loop is wedged; rebuilding the thread",
+                        _WS_WATCHDOG_GRACEFUL_RELINK_TIMEOUT,
+                    )
+                except Exception as exc:
+                    logger.warning("[Feishu] WS watchdog: graceful relink failed: %s; rebuilding the thread", exc)
+            # 2) Hard rebuild: the WS thread's loop is frozen (the threadsafe call never ran).
+            #    Abandon it and start a fresh client on a fresh thread — what the supervisor
+            #    does for a DEAD thread, extended to WEDGED ones.
+            await self._ws_hard_rebuild(why)
+        finally:
+            self._ws_relink_in_progress = False
+
+    async def _ws_hard_rebuild(self, why: str) -> None:
+        """Abandon the wedged WS thread and build a fresh client + thread."""
+        old_client = self._ws_client
+        # Freeze the old client so nothing it does late can deliver events or re-dial:
+        # its callbacks hop back through its event handler, and its ladder checks
+        # ``_auto_reconnect`` — nil both. The supervisor's link-up/retrying guards compare
+        # identity against ``self._ws_client``, which we replace below.
+        if old_client is not None:
+            try:
+                old_client._auto_reconnect = False
+            except Exception:
+                pass
+            try:
+                old_client._event_handler = None  # late frames from its socket: consumed, not delivered
+            except Exception:
+                pass
+        supervisor = self._ws_supervisor
+        if supervisor is not None:
+            supervisor.cancel()
+            self._ws_supervisor = None
+        self._ws_client = None
+        try:
+            await self._teardown_ws_thread(old_client, self._ws_thread_loop)
+        except Exception as exc:
+            logger.debug("[Feishu] WS watchdog: teardown of the wedged thread raised: %s", exc, exc_info=True)
+        self._ws_future = None
+        self._ws_thread_loop = None
+        # Bounded: a hanging rebuild must not hold this loop (or the adapter loop) hostage.
+        # On failure the supervisor/watchdog keeps retrying; every failure mode converges
+        # back to a supervisor rebuild because _ws_future/_ws_client end up consistent.
+        try:
+            await asyncio.wait_for(self._connect_websocket(), timeout=45.0)
+            logger.info("[Feishu] WS watchdog: rebuilt websocket client after stale link (%s)", why)
+        except Exception as exc:
+            logger.error("[Feishu] WS watchdog: rebuild failed (%s) — will retry on the next stale window", exc)
+        self._ws_supervisor = asyncio.ensure_future(self._supervise_websocket_thread())
 
     def _ws_link_up(self, ws_client: Any) -> None:
         """WS thread reports its link is up (SDK receive loop scheduled); re-stamp ``connected`` after a rebuild."""
@@ -3920,6 +4227,19 @@ class FeishuAdapter(BasePlatformAdapter):
             # Without the "channel" UA tag Feishu won't push group @mention events over WS.
             extra_ua_tags=["channel"],
         )
+        # Frame counter for the WS watchdog: bumped by a wrapper around the SDK's
+        # ``_handle_message`` (which runs ON the WS thread's loop for every inbound frame,
+        # including protocol PING/PONG and CONTROL). A frozen counter while TCP-level
+        # counters keep moving proves the WS loop is starved (Feishu then answers 3003).
+        frame_counter = [0]
+        original_handle_message = self._ws_client._handle_message
+
+        def _counting_handle_message(msg: Any, _inner: Any = original_handle_message) -> Any:
+            frame_counter[0] += 1
+            return _inner(msg)
+
+        self._ws_client._handle_message = _counting_handle_message
+        self._ws_client._hermes_frame_counter = frame_counter
         # The lark SDK owns this thread and fires every event/card callback on it; those hop back
         # to the adapter loop via run_coroutine_threadsafe, which copies the CALLER's context — so
         # whatever scope the WS thread carries is what pre-handler work (inbound media caching,

@@ -10,6 +10,7 @@ runs sync httpx connects through the process-wide Happy Eyeballs racer
 from __future__ import annotations
 
 import functools
+import os
 import socket
 import sys
 import threading
@@ -267,6 +268,36 @@ def close_shared_transports() -> int:
     return len(transports)
 
 
+_PROVIDER_READ_TIMEOUT_SECS_DEFAULT = 600.0
+
+
+def _provider_read_timeout_secs() -> Optional[float]:
+    """Bounded inter-chunk read timeout for the shared provider HTTP client.
+
+    ``read=None`` left every SSL_read unbounded: when a provider accepts the request and
+    then goes silent without closing (#10933), the worker thread wedges inside httpcore —
+    the streaming stale-watchdog's kills cannot unwind it, and the turn survives until the
+    inactivity killer ends it (observed: 37-minute silent hangs on the zai/glm coding
+    endpoint, turn wall clock ≈ stale-kill windows + the 30-minute inactivity cap).
+
+    A finite client-level read timeout bounds every read even where no request-level
+    timeout is passed (auxiliary builders, plugin calls reusing the shared transport).
+    It is an INTER-CHUNK gap, not a total-request budget: a healthy stream delivering
+    bytes at least this often never trips it, and request-level timeouts (the OpenAI
+    SDK's 600 s default, ``providers.<id>.request_timeout_seconds``) still take
+    precedence when present. ``HERMES_PROVIDER_READ_TIMEOUT_SECS`` overrides the value;
+    ``0`` restores the old unbounded behavior.
+    """
+    raw = os.environ.get("HERMES_PROVIDER_READ_TIMEOUT_SECS")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            return _PROVIDER_READ_TIMEOUT_SECS_DEFAULT
+        return value if value > 0 else None
+    return _PROVIDER_READ_TIMEOUT_SECS_DEFAULT
+
+
 def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False, verify: Any = True) -> Optional[Any]:
     """httpx client for OpenAI SDK calls with env-only proxy policy (None on failure).
 
@@ -289,7 +320,10 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
         import httpx
         proxy = _get_proxy_for_base_url(base_url)
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=20.0)
-        timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)  # read=None for SSE streaming
+        # read is a bounded INTER-CHUNK gap, not a total-request budget (see
+        # ``_provider_read_timeout_secs``) — a silent provider can no longer wedge a
+        # worker thread forever, and SSE throughput is unaffected on healthy streams.
+        timeout = httpx.Timeout(connect=15.0, read=_provider_read_timeout_secs(), write=15.0, pool=10.0)
         transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
         mounts = None

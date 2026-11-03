@@ -1073,12 +1073,44 @@ class _ThreadLocalLoopProxy:
         return f"<ThreadLocalLoopProxy target={self._target()!r}>"
 
 
+class _BoundedEndpointRequests:
+    """``requests``-module proxy for ``lark_oapi.ws.client``: injects a finite
+    ``(connect, read)`` timeout into the module's HTTP calls.
+
+    The SDK's ``_get_conn_url`` — the WS endpoint-discovery POST every dial and
+    every ladder retry runs through — calls ``requests.post`` with NO timeout on
+    the WS thread's loop, so one blackholed dial freezes the whole reconnect
+    ladder (observed 15:09→15:28 with no second attempt) and the watchdog's
+    graceful relink with it. The SDK resolves ``requests`` from its module
+    globals at call time, so swapping that one module attribute reaches every
+    call inside it while touching no other ``requests`` user in the process.
+    """
+
+    def __init__(self, real: Any, timeout: tuple[float, float]) -> None:
+        self._real = real
+        self._timeout = timeout
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", self._timeout)
+        return self._real.post(url, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
 def _install_lark_ws_isolation(ws_client_module: Any) -> None:
     """Install the thread-dispatching shims once per process (idempotent)."""
     global _WS_ISOLATION_INSTALLED
     with _WS_ISOLATION_LOCK:
         if _WS_ISOLATION_INSTALLED:
             return
+        # Before anything dials: give the SDK's endpoint-discovery POST a finite
+        # timeout (see _BoundedEndpointRequests — the unbounded requests.post is
+        # the wedge behind the 15:09→15:28 ladder freeze).
+        if not isinstance(ws_client_module.requests, _BoundedEndpointRequests):
+            ws_client_module.requests = _BoundedEndpointRequests(
+                ws_client_module.requests, _WS_ENDPOINT_FETCH_TIMEOUT,
+            )
         ws_client_module.loop = _ThreadLocalLoopProxy(ws_client_module.loop)
         real_connect = ws_client_module.websockets.connect
 

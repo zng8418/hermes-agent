@@ -46,6 +46,27 @@ def compact_result(result, *, user_message=None):
             # Consumers must not infer a new boundary from them after the real anchor is gone.
             value['_messages_are_turn_suffix'] = True
             value.pop('current_turn_user_idx', None)
+        # ★ 2026-11-06 主控实测: 快照里剩下的"本 turn 后缀"仍然可以非常大 ——
+        #   实测一条 4.74MB 的快照装着 272 条 assistant/tool 消息, 其中 4.2MB (88.9%)
+        #   是思维链三件套 (reasoning / reasoning_details / reasoning_content 各约 1MB)
+        #   + anthropic_content_blocks。
+        #   而本函数的所有调用方 (hermes_state_runtime 写入 ×2 / gateway.session_results
+        #   写入 ×1) 都是【快照存储路径】, 且快照的全部消费方
+        #   (session_a2a / session_cron / api_server_authority_runs /
+        #    session_settlement_recovery) 只读 final_response / cron_result /
+        #   cron_job_flags / result 顶层字段 —— 【没有任何一处消费 result.messages】。
+        #   会话历史另有权威副本 (messages 表), 已单独存了 reasoning 三件套。
+        #   ⇒ 快照里的思维链字段是纯冗余, 直接剥掉, 不影响任何恢复路径。
+        #   注意: anthropic_content_blocks 保留 —— 它是 Anthropic 思考重放的载体
+        #   (agent/anthropic_message_convert.py 读它还原 thinking + tool_use 的交错顺序),
+        #   剥掉会让重放退化成 reasoning_details 的近似形式。
+        #   ★ 放在裁剪块【之外】: 已有 _messages_are_turn_suffix 的快照会跳过整个裁剪块,
+        #     剥离若写在块内则对它们完全不生效 (第一版就踩了这个坑, 被回放脚本抓到)。
+        for _m in value.get('messages') or ():
+            if not isinstance(_m, dict):
+                continue
+            for _field in ('reasoning', 'reasoning_details', 'reasoning_content'):
+                _m.pop(_field, None)
     result['result'] = value
     return result
 

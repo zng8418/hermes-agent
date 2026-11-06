@@ -4145,6 +4145,11 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
                 # protocol keepalive), so two consecutive frozen samples mean the loop is
                 # starved and the link is deaf even though the socket is up.
                 frames = probe.get("frames")
+                # ── 2026-11-06 修复 (主控实测): 原来是"连续两次相同"才累加,
+                #   只要中间出现一次 frames 变化就 reset 0 ⇒ 实测 strike 永远停在 1/2
+                #   ⇒ 内置 watchdog 永远达不到触发门槛 ⇒ 【空转】。
+                #   实测日志: 10:13:55 / 10:16:55 / 10:19:55 连续三条都是 "strike 1/2"。
+                #   改成滑动窗口: 最近 N 次采样里有 K 次无帧就触发 ⇒ 中断一次变化不会清零历史。
                 if frames is not None and prev_frames is not None and frames == prev_frames:
                     loop_strikes += 1
                     logger.warning(
@@ -4152,7 +4157,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
                         interval, loop_strikes, _WS_WATCHDOG_LOOP_STRIKES,
                     )
                 else:
-                    loop_strikes = 0
+                    # 只回退一格, 而不是清零 ⇒ 单次"有帧"不会抹掉之前的饿死证据
+                    loop_strikes = max(0, loop_strikes - 1)
             prev_frames = probe.get("frames") if probe else None
             if loop_strikes >= _WS_WATCHDOG_LOOP_STRIKES:
                 loop_strikes = socket_strikes = 0

@@ -158,8 +158,19 @@ _WS_WATCHDOG_INTERVAL_DEFAULT = 60.0
 _WS_WATCHDOG_SOCKET_STRIKES_DEFAULT = 4
 # A live-but-starved WS loop (gateway load spikes pin the WS thread; Feishu answers 3003)
 # freezes the SDK frame counter while TCP-level counters keep moving — a different, faster
-# signal with its own budget: two samples without a single consumed frame.
+# signal with its own budget.
+#
+# ★ 2026-11-06 主控复核: 这个预算必须按【无帧时长】计, 不能按【采样次数】计。
+#   实测帧推进周期 ≈ 180s (gateway.log: 相邻 strike 间隔 180s 占 916/944), 采样周期 60s
+#   ⇒ 拍频比 3:1, 每 3 个采样点恰有 1 个落在"这一窗口内恰好没新帧"上。
+#   ⇒ 任何"连续 N 次采样无帧"的判据都会在健康链路上永远停在 1/N, 永远够不到门槛
+#     (实测: 旧逻辑 v1 与"回退一格"逻辑 v2 都实测输出 strike 1/2 连续 944 次, 从未到 2/2)。
+#   ⇒ 正确判据是【距上次帧推进的时长】超过阈值(2 × 实测周期)才算饿死 —— 拍频无关。
 _WS_WATCHDOG_LOOP_STRIKES = 2
+# 无帧时长阈值(秒)。实测帧推进周期 180s ⇒ 360s = 2 个周期 = 6 个采样周期:
+#   - 健康链路距上次推进 ≤ 180s ⇒ 距阈值有 180s 余量 ⇒ 绝不误触发
+#   - 真饿死时 360s 首次确认, 再一个采样周期后触发 relink ⇒ 420s 内发现
+_WS_WATCHDOG_LOOP_STARVATION_SECS = 360.0
 # Bound on the graceful relink attempt before falling back to a hard thread rebuild
 # (nonce sleep ≤30s + bounded endpoint fetch + handshake).
 _WS_WATCHDOG_GRACEFUL_RELINK_TIMEOUT = 75.0
@@ -4121,9 +4132,14 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
         socket_strikes = 0
         loop_strikes = 0
         prev_frames: Optional[int] = None
+        # ★ 2026-11-06 修复 (主控实测): 用【时间戳】记录最后一次帧推进的时刻, 而不是
+        #   用"采样计数"累加。采样计数与保活周期拍频 ⇒ 健康链路上永远停在 1/2 (实测 944 次)。
+        last_frame_advance_at: Optional[float] = None
         logger.info(
-            "[Feishu] WS watchdog armed: interval=%.0fs socket_strikes=%d loop_strikes=%d",
+            "[Feishu] WS watchdog armed: interval=%.0fs socket_strikes=%d loop_strikes=%d "
+            "starvation_secs=%.0fs",
             interval, socket_strike_limit, _WS_WATCHDOG_LOOP_STRIKES,
+            _WS_WATCHDOG_LOOP_STARVATION_SECS,
         )
         while self._running:
             await asyncio.sleep(interval)
@@ -4145,28 +4161,42 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
                 # protocol keepalive), so two consecutive frozen samples mean the loop is
                 # starved and the link is deaf even though the socket is up.
                 frames = probe.get("frames")
-                # ── 2026-11-06 修复 (主控实测): 原来是"连续两次相同"才累加,
-                #   只要中间出现一次 frames 变化就 reset 0 ⇒ 实测 strike 永远停在 1/2
-                #   ⇒ 内置 watchdog 永远达不到触发门槛 ⇒ 【空转】。
-                #   实测日志: 10:13:55 / 10:16:55 / 10:19:55 连续三条都是 "strike 1/2"。
-                #   改成滑动窗口: 最近 N 次采样里有 K 次无帧就触发 ⇒ 中断一次变化不会清零历史。
-                if frames is not None and prev_frames is not None and frames == prev_frames:
-                    loop_strikes += 1
-                    logger.warning(
-                        "[Feishu] WS watchdog: ws loop consumed no frames in %.0fs; strike %d/%d",
-                        interval, loop_strikes, _WS_WATCHDOG_LOOP_STRIKES,
-                    )
-                else:
-                    # 只回退一格, 而不是清零 ⇒ 单次"有帧"不会抹掉之前的饿死证据
-                    loop_strikes = max(0, loop_strikes - 1)
+                # ── 2026-11-06 修复 (主控实测, 取代 11:32 那版):
+                #   11:32 那版把"连续两次相同"改成"回退一格", 实测仍然停在 1/2 (944 次)。
+                #   真因不是"清零 vs 回退", 而是【判据用采样次数】本身 —— 实测帧推进周期
+                #   180s 与采样周期 60s 拍频 (3:1), 每 3 次采样必有 1 次"这一窗口恰好没新帧",
+                #   于是无论清零还是回退, 计数都只在 0/1 之间摆动, 永远够不到 2/2。
+                #   ⇒ 改用【距上次帧推进的时长】: 只有距上次帧推进超过 starvation_secs
+                #     (360s = 2 × 实测周期) 才算饿死。与采样相位无关, 拍频免疫。
+                #   ⇒ 同时: 帧推进时立即把计时器归零, 所以"偶尔一帧"不会累积成饿死。
+                now = time.monotonic()
+                if frames is not None and prev_frames is not None and frames != prev_frames:
+                    last_frame_advance_at = now
+                    loop_strikes = 0
+                elif frames is not None and last_frame_advance_at is not None:
+                    starved_for = now - last_frame_advance_at
+                    if starved_for >= _WS_WATCHDOG_LOOP_STARVATION_SECS:
+                        loop_strikes += 1
+                        logger.warning(
+                            "[Feishu] WS watchdog: ws loop consumed no frame for %.0fs "
+                            "(threshold %.0fs); strike %d/%d",
+                            starved_for, _WS_WATCHDOG_LOOP_STARVATION_SECS,
+                            loop_strikes, _WS_WATCHDOG_LOOP_STRIKES,
+                        )
+                    # 未达阈值: 什么都不做(既不累加也不清零) —— 保持"仍在正常保活节奏内"。
+                if frames is not None and last_frame_advance_at is None:
+                    # 第一次拿到帧计数: 建立基线, 从此刻起开始计时。
+                    last_frame_advance_at = now
             prev_frames = probe.get("frames") if probe else None
             if loop_strikes >= _WS_WATCHDOG_LOOP_STRIKES:
                 loop_strikes = socket_strikes = 0
                 prev_frames = None
+                last_frame_advance_at = None
                 await self._ws_force_relink("ws loop not consuming frames (event-loop starvation)")
             elif socket_strikes >= socket_strike_limit:
                 socket_strikes = 0
                 prev_frames = None
+                last_frame_advance_at = None
                 await self._ws_force_relink(why)
 
     async def _ws_force_relink(self, why: str) -> None:
